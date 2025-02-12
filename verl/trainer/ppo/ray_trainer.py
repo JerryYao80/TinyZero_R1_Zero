@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
-FSDP PPO Trainer with Ray-based single controller.
-This trainer supports model-agonistic model initialization with huggingface
+基于Ray的FSDP PPO训练器
+此训练器支持使用huggingface进行与模型无关的模型初始化
 """
 
 import os
@@ -40,32 +41,36 @@ WorkerType = Type[Worker]
 
 class Role(Enum):
     """
-    To create more roles dynamically, you can subclass Role and add new members
+    角色枚举类
+    可以通过继承Role类并添加新成员来动态创建更多角色
     """
-    Actor = 0
-    Rollout = 1
-    ActorRollout = 2
-    Critic = 3
-    RefPolicy = 4
-    RewardModel = 5
-    ActorRolloutRef = 6
+    Actor = 0  # 演员（策略网络）
+    Rollout = 1  # 采样器
+    ActorRollout = 2  # 演员采样器
+    Critic = 3  # 评论家（价值网络）
+    RefPolicy = 4  # 参考策略
+    RewardModel = 5  # 奖励模型
+    ActorRolloutRef = 6  # 演员采样器参考
 
 
 @dataclass
 class ResourcePoolManager:
     """
-    Define a resource pool specification. Resource pool will be initialized first.
-    Mapping
+    资源池管理器
+    定义资源池规范，资源池将首先被初始化
     """
-    resource_pool_spec: dict[str, list[int]]
-    mapping: dict[Role, str]
-    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    resource_pool_spec: dict[str, list[int]]  # 资源池规范
+    mapping: dict[Role, str]  # 角色到资源池的映射
+    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)  # 资源池字典
 
     def create_resource_pool(self):
+        """
+        创建资源池
+        """
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
-            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
-            # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
-            # For Megatron backend, we recommend using max_colocate_count>1 that can utilize different WorkerGroup for differnt models
+            # max_colocate_count表示每个RayResourcePool中WorkerGroups（即进程）的数量
+            # 对于FSDP后端，建议使用max_colocate_count=1，将所有WorkerGroups合并为一个
+            # 对于Megatron后端，建议使用max_colocate_count>1，可以为不同模型使用不同的WorkerGroup
             resource_pool = RayResourcePool(process_on_nodes=process_on_nodes,
                                             use_gpu=True,
                                             max_colocate_count=1,
@@ -73,7 +78,9 @@ class ResourcePoolManager:
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
     def get_resource_pool(self, role: Role) -> RayResourcePool:
-        """Get the resource pool of the worker_cls"""
+        """
+        获取指定角色的资源池
+        """
         return self.resource_pool_dict[self.mapping[role]]
 
 
@@ -82,6 +89,18 @@ from verl.utils.torch_functional import masked_mean
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
+    """
+    应用KL散度惩罚
+    
+    Args:
+        data: 数据协议对象
+        kl_ctrl: 自适应KL控制器
+        kl_penalty: KL惩罚类型
+    
+    Returns:
+        data: 更新后的数据
+        metrics: 相关指标
+    """
     responses = data.batch['responses']
     response_length = responses.size(1)
     token_level_scores = data.batch['token_level_scores']
@@ -89,7 +108,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     attention_mask = data.batch['attention_mask']
     response_mask = attention_mask[:, -response_length:]
 
-    # compute kl between ref_policy and current policy
+    # 计算参考策略和当前策略之间的KL散度
     if 'ref_log_prob' in data.batch.keys():
         kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
                                     kl_penalty=kl_penalty)  # (batch_size, response_length)
@@ -99,12 +118,14 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
         beta = 0
         kld = torch.zeros_like(response_mask, dtype=torch.float32)
 
+    # 计算带惩罚的token级别奖励
     token_level_rewards = token_level_scores - beta * kld
 
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    # 计算当前KL散度
+    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # 对序列取平均
     current_kl = torch.mean(current_kl, dim=0).item()
 
-    # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
+    # 更新KL控制器
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
     data.batch['token_level_rewards'] = token_level_rewards
 
@@ -114,9 +135,21 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
-    # prepare response group
-    # TODO: add other ways to estimate advantages
+    """
+    计算优势函数
+    
+    Args:
+        data: 数据协议对象
+        adv_estimator: 优势估计器类型 ('gae' 或 'grpo')
+        gamma: 折扣因子
+        lam: GAE-Lambda参数
+        num_repeat: 重复次数
+    
+    Returns:
+        data: 更新后的数据
+    """
     if adv_estimator == 'gae':
+        # 广义优势估计（GAE）
         values = data.batch['values']
         responses = data.batch['responses']
         response_length = responses.size(-1)
@@ -131,6 +164,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == 'grpo':
+        # GRPO优势估计
         token_level_rewards = data.batch['token_level_rewards']
         index = data.non_tensor_batch['uid']
         responses = data.batch['responses']
@@ -148,12 +182,24 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
 
 
 def reduce_metrics(metrics: dict):
+    """
+    对指标进行归约（取平均值）
+    """
     for key, val in metrics.items():
         metrics[key] = np.mean(val)
     return metrics
 
 
 def _compute_response_info(batch):
+    """
+    计算响应信息
+    
+    Args:
+        batch: 批次数据
+    
+    Returns:
+        dict: 包含响应掩码、提示长度和响应长度的字典
+    """
     response_length = batch.batch['responses'].shape[-1]
 
     prompt_mask = batch.batch['attention_mask'][:, :-response_length]
@@ -170,7 +216,17 @@ def _compute_response_info(batch):
 
 
 def compute_data_metrics(batch, use_critic=True):
-    # TODO: add response length
+    """
+    计算数据相关的指标
+    
+    Args:
+        batch: 批次数据
+        use_critic: 是否使用评论家网络
+    
+    Returns:
+        dict: 包含各种指标的字典
+    """
+    # 计算序列级别的分数和奖励
     sequence_score = batch.batch['token_level_scores'].sum(-1)
     sequence_reward = batch.batch['token_level_rewards'].sum(-1)
 
@@ -179,81 +235,63 @@ def compute_data_metrics(batch, use_critic=True):
 
     max_response_length = batch.batch['responses'].shape[-1]
 
+    # 计算提示和响应的掩码
     prompt_mask = batch.batch['attention_mask'][:, :-max_response_length].bool()
     response_mask = batch.batch['attention_mask'][:, -max_response_length:].bool()
 
     max_prompt_length = prompt_mask.size(-1)
 
+    # 获取响应信息
     response_info = _compute_response_info(batch)
     prompt_length = response_info['prompt_length']
     response_length = response_info['response_length']
 
+    # 计算有效的优势值和回报值
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
+    # 如果使用评论家网络，计算额外的指标
     if use_critic:
         values = batch.batch['values']
         valid_values = torch.masked_select(values, response_mask)
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
+    # 构建指标字典
     metrics = {
-        # score
-        'critic/score/mean':
-            torch.mean(sequence_score).detach().item(),
-        'critic/score/max':
-            torch.max(sequence_score).detach().item(),
-        'critic/score/min':
-            torch.min(sequence_score).detach().item(),
-        # reward
-        'critic/rewards/mean':
-            torch.mean(sequence_reward).detach().item(),
-        'critic/rewards/max':
-            torch.max(sequence_reward).detach().item(),
-        'critic/rewards/min':
-            torch.min(sequence_reward).detach().item(),
-        # adv
-        'critic/advantages/mean':
-            torch.mean(valid_adv).detach().item(),
-        'critic/advantages/max':
-            torch.max(valid_adv).detach().item(),
-        'critic/advantages/min':
-            torch.min(valid_adv).detach().item(),
-        # returns
-        'critic/returns/mean':
-            torch.mean(valid_returns).detach().item(),
-        'critic/returns/max':
-            torch.max(valid_returns).detach().item(),
-        'critic/returns/min':
-            torch.min(valid_returns).detach().item(),
+        # 分数相关指标
+        'critic/score/mean': torch.mean(sequence_score).detach().item(),
+        'critic/score/max': torch.max(sequence_score).detach().item(),
+        'critic/score/min': torch.min(sequence_score).detach().item(),
+        # 奖励相关指标
+        'critic/rewards/mean': torch.mean(sequence_reward).detach().item(),
+        'critic/rewards/max': torch.max(sequence_reward).detach().item(),
+        'critic/rewards/min': torch.min(sequence_reward).detach().item(),
+        # 优势函数相关指标
+        'critic/advantages/mean': torch.mean(valid_adv).detach().item(),
+        'critic/advantages/max': torch.max(valid_adv).detach().item(),
+        'critic/advantages/min': torch.min(valid_adv).detach().item(),
+        # 回报相关指标
+        'critic/returns/mean': torch.mean(valid_returns).detach().item(),
+        'critic/returns/max': torch.max(valid_returns).detach().item(),
+        'critic/returns/min': torch.min(valid_returns).detach().item(),
+        # 评论家网络相关指标（如果使用）
         **({
-            # values
             'critic/values/mean': torch.mean(valid_values).detach().item(),
             'critic/values/max': torch.max(valid_values).detach().item(),
             'critic/values/min': torch.min(valid_values).detach().item(),
-            # vf explained var
             'critic/vf_explained_var': (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
         } if use_critic else {}),
-
-        # response length
-        'response_length/mean':
-            torch.mean(response_length).detach().item(),
-        'response_length/max':
-            torch.max(response_length).detach().item(),
-        'response_length/min':
-            torch.min(response_length).detach().item(),
-        'response_length/clip_ratio':
-            torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
-        # prompt length
-        'prompt_length/mean':
-            torch.mean(prompt_length).detach().item(),
-        'prompt_length/max':
-            torch.max(prompt_length).detach().item(),
-        'prompt_length/min':
-            torch.min(prompt_length).detach().item(),
-        'prompt_length/clip_ratio':
-            torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+        # 响应长度相关指标
+        'response_length/mean': torch.mean(response_length).detach().item(),
+        'response_length/max': torch.max(response_length).detach().item(),
+        'response_length/min': torch.min(response_length).detach().item(),
+        'response_length/clip_ratio': torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+        # 提示长度相关指标
+        'prompt_length/mean': torch.mean(prompt_length).detach().item(),
+        'prompt_length/max': torch.max(prompt_length).detach().item(),
     }
+
     return metrics
 
 
